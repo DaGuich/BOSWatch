@@ -11,3 +11,6 @@ log/
 \.settings/
 
 \.idea/
+\.vscode/
+
+\.venv

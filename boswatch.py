@@ -1,413 +1,246 @@
-#!/usr/bin/python
-# -*- coding: UTF-8 -*-
-#
-"""
-BOSWatch
-Python script to receive and decode German BOS information with rtl_fm and multimon-NG
-Through a simple plugin system, data can easily be transferred to other applications
-For more information see the README.md
-
-@author: 		Bastian Schroll
-@author: 		Jens Herrmann
-
-Thanks to smith_fms and McBo from Funkmeldesystem.de - Forum for Inspiration and Groundwork!
-
-GitHUB:		https://github.com/Schrolli91/BOSWatch
-"""
-
-import logging
-import logging.handlers
+#!/usr/bin/python3
 
 import argparse		# for parse the args
-import ConfigParser	# for parse the config file
+import configparser # for parsing configuration files
+import io
+import logging		# for logging
+import logging.config
 import os			# for log mkdir
-import sys			# for py version
-import time			# for time.sleep()
+import shlex		# for command bulding# for command bulding
 import subprocess	# for starting rtl_fm and multimon-ng
-
-from includes import globalVars  # Global variables
-from includes import MyTimedRotatingFileHandler  # extension of TimedRotatingFileHandler
-from includes import checkSubprocesses  # check startup of the subprocesses
-from includes.helper import configHandler
-from includes.helper import freqConverter
-
-#
-# Check for exisiting config/config.ini-file
-#
-if not os.path.exists(os.path.dirname(os.path.abspath(__file__))+"/config/config.ini"):
-	print "ERROR: No config.ini found"
-	exit(1)
-
-#
-# ArgParser
-# Have to be before main program
-#
-try:
-	# With -h or --help you get the Args help
-	parser = argparse.ArgumentParser(prog="boswatch.py",
-									description="BOSWatch is a Python Script to recive and decode german BOS information with rtl_fm and multimon-NG",
-									epilog="More options you can find in the extern config.ini file in the folder /config")
-	# parser.add_argument("-c", "--channel", help="BOS Channel you want to listen")
-	parser.add_argument("-f", "--freq", help="Frequency you want to listen to", required=True)
-	parser.add_argument("-d", "--device", help="Device you want to use (check with rtl_test)", type=int, default=0)
-	parser.add_argument("-e", "--error", help="Frequency-error of your device in PPM", default=0)
-	parser.add_argument("-a", "--demod", help="Demodulation functions", choices=['FMS', 'ZVEI', 'POC512', 'POC1200', 'POC2400'], required=True, nargs="+")
-	parser.add_argument("-s", "--squelch", help="Level of squelch", type=int, default=0)
-	parser.add_argument("-g", "--gain", help="Level of gain", type=int, default=100)
-	parser.add_argument("-u", "--usevarlog", help="Use '/var/log/boswatch' for logfiles instead of subdir 'log' in BOSWatch directory", action="store_true")
-	parser.add_argument("-v", "--verbose", help="Show more information", action="store_true")
-	parser.add_argument("-q", "--quiet", help="Show no information. Only logfiles", action="store_true")
-	# We need this argument for testing (skip instantiate of rtl-fm and multimon-ng):
-	parser.add_argument("-t", "--test", help=argparse.SUPPRESS, action="store_true")
-	args = parser.parse_args()
-except SystemExit:
-	# -h or --help called, exit right now
-	exit(0)
-except:
-	# we couldn't work without arguments -> exit
-	print "ERROR: cannot parsing the arguments"
-	exit(1)
+import sys			# for py version
+import threading
+import time			# for time.sleep()
 
 
-#
-# Main program
-#
-try:
-	# initialization:
-	rtl_fm = None
-	multimon_ng = None
-	nmaHandler = None
-
-	try:
-		#
-		# Script-pathes
-		#
-		globalVars.script_path = os.path.dirname(os.path.abspath(__file__))
-
-		#
-		# Set log_path
-		#
-		if args.usevarlog:
-			globalVars.log_path = "/var/log/BOSWatch/"
-		else:
-			globalVars.log_path = globalVars.script_path+"/log/"
-
-		#
-		# If necessary create log-path
-		#
-		if not os.path.exists(globalVars.log_path):
-			os.mkdir(globalVars.log_path)
-	except:
-		# we couldn't work without logging -> exit
-		print "ERROR: cannot initialize paths"
-		exit(1)
-
-	#
-	# Create new myLogger...
-	#
-	try:
-		myLogger = logging.getLogger()
-		myLogger.setLevel(logging.DEBUG)
-		# set log string format
-		#formatter = logging.Formatter('%(asctime)s - %(module)-15s %(funcName)-15s [%(levelname)-8s] %(message)s', '%d.%m.%Y %H:%M:%S')
-		formatter = logging.Formatter('%(asctime)s - %(module)-15s [%(levelname)-8s] %(message)s', '%d.%m.%Y %H:%M:%S')
-		# create a file logger
-		fh = MyTimedRotatingFileHandler.MyTimedRotatingFileHandler(globalVars.log_path+"boswatch.log", "midnight", interval=1, backupCount=999)
-		# Starts with log level >= Debug
-		# will be changed with config.ini-param later
-		fh.setLevel(logging.DEBUG)
-		fh.setFormatter(formatter)
-		myLogger.addHandler(fh)
-		# create a display logger
-		ch = logging.StreamHandler()
-		# log level for display: Default: info
-		if args.verbose:
-			ch.setLevel(logging.DEBUG)
-		elif args.quiet:
-			ch.setLevel(logging.CRITICAL)
-		else:
-			ch.setLevel(logging.INFO)
-		ch.setFormatter(formatter)
-		myLogger.addHandler(ch)
-
-	except:
-		# we couldn't work without logging -> exit
-		print "ERROR: cannot create logger"
-		exit(1)
-
-	# initialization of the logging was fine, continue...
-	try:
-		#
-		# Clear the logfiles
-		#
-		fh.doRollover()
-		rtl_log = open(globalVars.log_path+"rtl_fm.log", "w")
-		mon_log = open(globalVars.log_path+"multimon.log", "w")
-		rawMmOut = open(globalVars.log_path+"mm_raw.txt", "w")
-		rtl_log.write("")
-		mon_log.write("")
-		rawMmOut.write("")
-		rtl_log.close()
-		mon_log.close()
-		rawMmOut.close()
-		logging.debug("BOSWatch has started")
-		logging.debug("Logfiles cleared")
-
-	except:
-		# It's an error, but we could work without that stuff...
-		logging.error("cannot clear Logfiles")
-		logging.debug("cannot clear Logfiles", exc_info=True)
-
-	#
-	# For debug display/log args
-	#
-	try:
-		logging.debug("SW Version:	%s",globalVars.versionNr)
-		logging.debug("Branch:		%s",globalVars.branch)
-		logging.debug("Build Date:	%s",globalVars.buildDate)
-		logging.debug("Python Vers:	%s",sys.version)
-		logging.debug("BOSWatch given arguments")
-		if args.test:
-			logging.debug(" - Test-Mode!")
-
-		logging.debug(" - Frequency: %s", freqConverter.freqToHz(args.freq))
-		logging.debug(" - Device: %s", args.device)
-		logging.debug(" - PPM Error: %s", args.error)
-		logging.debug(" - Squelch: %s", args.squelch)
-		logging.debug(" - Gain: %s", args.gain)
-
-		demodulation = ""
-		if "FMS" in args.demod:
-			demodulation += "-a FMSFSK "
-			logging.debug(" - Demod: FMS")
-		if "ZVEI" in args.demod:
-			demodulation += "-a ZVEI1 "
-			logging.debug(" - Demod: ZVEI")
-		if "POC512" in args.demod:
-			demodulation += "-a POCSAG512 "
-			logging.debug(" - Demod: POC512")
-		if "POC1200" in args.demod:
-			demodulation += "-a POCSAG1200 "
-			logging.debug(" - Demod: POC1200")
-		if "POC2400" in args.demod:
-			demodulation += "-a POCSAG2400 "
-			logging.debug(" - Demod: POC2400")
-
-		logging.debug(" - Use /var/log: %s", args.usevarlog)
-		logging.debug(" - Verbose Mode: %s", args.verbose)
-		logging.debug(" - Quiet Mode: %s", args.quiet)
-
-		if not args.quiet: #only if not quiet mode
-			from includes import shellHeader
-			shellHeader.printHeader(args)
-
-		if args.test:
-			logging.warning("!!! We are in Test-Mode !!!")
-
-	except:
-		# we couldn't work without config -> exit
-		logging.critical("cannot display/log args")
-		logging.debug("cannot display/log args", exc_info=True)
-		exit(1)
-
-	#
-	# Read config.ini
-	#
-	try:
-		logging.debug("reading config file")
-		globalVars.config = ConfigParser.ConfigParser()
-		globalVars.config.read(globalVars.script_path+"/config/config.ini")
-		# if given loglevel is debug:
-		if globalVars.config.getint("BOSWatch","loglevel") == 10:
-			configHandler.checkConfig("BOSWatch")
-			configHandler.checkConfig("multicastAlarm")
-			configHandler.checkConfig("Filters")
-			configHandler.checkConfig("FMS")
-			configHandler.checkConfig("ZVEI")
-			configHandler.checkConfig("POC")
-			configHandler.checkConfig("Plugins")
-			configHandler.checkConfig("Filters")
-			#NMAHandler is outputed below
-	except:
-		# we couldn't work without config -> exit
-		logging.critical("cannot read config file")
-		logging.debug("cannot read config file", exc_info=True)
-		exit(1)
+SLEEP_TIME_AFTER_PROC_START = 3
 
 
-	#
-	# Set the loglevel and backupCount of the file handler
-	#
-	try:
-		logging.debug("set loglevel of fileHandler to: %s",globalVars.config.getint("BOSWatch","loglevel"))
-		fh.setLevel(globalVars.config.getint("BOSWatch","loglevel"))
-		logging.debug("set backupCount of fileHandler to: %s", globalVars.config.getint("BOSWatch","backupCount"))
-		fh.setBackupCount(globalVars.config.getint("BOSWatch","backupCount"))
-	except:
-		# It's an error, but we could work without that stuff...
-		logging.error("cannot set loglevel of fileHandler")
-		logging.debug("cannot set loglevel of fileHandler", exc_info=True)
+class LogPipe(threading.Thread):
+	def __init__(self, logger):
+		super().__init__()
+		self.daemon = True
+		self.__fd_read, self.__fd_write = os.pipe()
+		self.__pipeReader = os.fdopen(self.__fd_read)
+		self.__logger = logger
+		self.start()
+
+	def fileno(self):
+		return self.__fd_write
+
+	def run(self):
+		for line in iter(self.__pipeReader.readline, ''):
+			self.__logger.info(line.strip())
+		self.__pipeReader.close()
+
+	def close(self):
+		os.close(self.__fd_write)
 
 
-	# initialization was fine, continue with main program...
+def parse_args():
+	parser = argparse.ArgumentParser(
+		prog="boswatch.py", 
+		description="BOSWatch is a Python Script to recive and " \
+					"decode german BOS information with rtl_fm and multimon-NG", 
+		epilog="More options you can find in the extern config.ini file in " \
+			   "the folder /config")
+	parser.add_argument("--config", 
+						default=os.path.abspath(os.path.join(os.path.dirname(__file__), 'config')),
+						help="Parse to config file directory")
+	parser.add_argument("--plugin",
+						default="main",
+						help="Plugin which should be started. (Main for main programming)")
+	return parser.parse_args()
 
-	#
-	# Load plugins
-	#
-	try:
-		from includes import pluginLoader
-		pluginLoader.loadPlugins()
-	except:
-		# we couldn't work without plugins -> exit
-		logging.critical("cannot load Plugins")
-		logging.debug("cannot load Plugins", exc_info=True)
-		exit(1)
 
-	#
-	# Load filters
-	#
-	try:
-		if globalVars.config.getboolean("BOSWatch","useRegExFilter"):
-			from includes import regexFilter
-			regexFilter.loadFilters()
-	except:
-		# It's an error, but we could work without that stuff...
-		logging.error("cannot load filters")
-		logging.debug("cannot load filters", exc_info=True)
+def parse_config(config_path, plugin):
+	"""
+	Parse configuration
 
-	#
-	# Load description lists
-	#
-	try:
-		if globalVars.config.getboolean("FMS","idDescribed") or globalVars.config.getboolean("ZVEI","idDescribed") or globalVars.config.getboolean("POC","idDescribed"):
-			from includes import descriptionList
-			descriptionList.loadDescriptionLists()
-	except:
-		# It's an error, but we could work without that stuff...
-		logging.error("cannot load description lists")
-		logging.debug("cannot load description lists", exc_info=True)
+	@param config_path
+		Directory in which the configuration files are stored
+	@param plugin
+		Plugin which is started
+	@return ConfigParser Instance which holds all the configuration
+	"""
+	config = configparser.ConfigParser()
 
-	#
-	# Start rtl_fm
-	#
-	try:
-		if not args.test:
-			logging.debug("starting rtl_fm")
-			command = ""
-			if globalVars.config.has_option("BOSWatch","rtl_path"):
-				command = globalVars.config.get("BOSWatch","rtl_path")
-			command = command+"rtl_fm -d "+str(args.device)+" -f "+str(freqConverter.freqToHz(args.freq))+" -M fm -p "+str(args.error)+" -E DC -F 0 -l "+str(args.squelch)+" -g "+str(args.gain)+" -s 22050"
-			rtl_fm = subprocess.Popen(command.split(),
-					#stdin=rtl_fm.stdout,
-					stdout=subprocess.PIPE,
-					stderr=open(globalVars.log_path+"rtl_fm.log","a"),
-					shell=False)
-			# rtl_fm doesn't self-destruct, when an error occurs
-			# wait a moment to give the subprocess a chance to write the logfile
-			time.sleep(3)
-			checkSubprocesses.checkRTL()
-		else:
-			logging.warning("!!! Test-Mode: rtl_fm not started !!!")
-	except:
-		# we couldn't work without rtl_fm -> exit
-		logging.critical("cannot start rtl_fm")
-		logging.debug("cannot start rtl_fm", exc_info=True)
-		exit(1)
-
-	#
-	# Start multimon
-	#
-	try:
-		if not args.test:
-			logging.debug("starting multimon-ng")
-			command = ""
-			if globalVars.config.has_option("BOSWatch","multimon_path"):
-				command = globalVars.config.get("BOSWatch","multimon_path")
-			command = command+"multimon-ng "+str(demodulation)+" -f alpha -t raw /dev/stdin - "
-			multimon_ng = subprocess.Popen(command.split(),
-				stdin=rtl_fm.stdout,
-				stdout=subprocess.PIPE,
-				stderr=open(globalVars.log_path+"multimon.log","a"),
-				shell=False)
-			# multimon-ng  doesn't self-destruct, when an error occurs
-			# wait a moment to give the subprocess a chance to write the logfile
-			time.sleep(3)
-			checkSubprocesses.checkMultimon()
-		else:
-			logging.warning("!!! Test-Mode: multimon-ng not started !!!")
-	except:
-		# we couldn't work without multimon-ng -> exit
-		logging.critical("cannot start multimon-ng")
-		logging.debug("cannot start multimon-ng", exc_info=True)
-		exit(1)
-
-	#
-	# Get decoded data from multimon-ng and call BOSWatch-decoder
-	#
-	if not args.test:
-		logging.debug("start decoding")
-		while True:
-			decoded = str(multimon_ng.stdout.readline()) #Get line data from multimon stdout
-			from includes import decoder
-			decoder.decode(freqConverter.freqToHz(args.freq), decoded)
-
-			# write multimon-ng raw data
-			if globalVars.config.getboolean("BOSWatch","writeMultimonRaw"):
-				try:
-					rawMmOut = open(globalVars.log_path+"mm_raw.txt", "a")
-					rawMmOut.write(decoded)
-				except:
-					logging.warning("cannot write raw multimon data")
-				finally:
-					rawMmOut.close()
+	config_file = os.path.join(config_path, 'default.ini')
+	if os.path.isfile(config_file):
+		config.read(config_file)
 	else:
-		logging.debug("start testing")
-		testFile = open(globalVars.script_path+"/citest/testdata.txt","r")
-		for testData in testFile:
-			if (len(testData.rstrip(' \t\n\r')) > 1) and ("#" not in testData[0]):
-				logging.info("Testdata: %s", testData.rstrip(' \t\n\r'))
-				from includes import decoder
-				decoder.decode(freqConverter.freqToHz(args.freq), testData)
-				#time.sleep(1)
-		logging.debug("test finished")
+		print('Config file not found: {}'.format(config_file))
 
-except KeyboardInterrupt:
-	logging.warning("Keyboard Interrupt")
-except SystemExit:
-	# SystemExitException is thrown if daemon was terminated
-	logging.warning("SystemExit received")
-	# only exit to call finally-block
-	exit()
-except:
-	logging.exception("unknown error")
-finally:
+	config_file = os.path.join(config_path, '{}.ini'.format(plugin.lower()))
+	if os.path.isfile(config_file):
+		config.read(config_file)
+	else:
+		print('Config file not found: {}'.format(config_file))
+
+	return config
+
+
+def setup_listener(logger, config, listener, mm_write):
+	logger.info('Setup listener')
+	section = 'listener_{}'.format(listener)
+	if not config.has_section(section):
+		logger.error('Listener is not properly configured')
+		return
+
+	device = config.get(section, 'device')
+	freq = config.get(section, 'frequency')
+	squelch = config.getfloat(section, 'squelch')
+	gain = config.getfloat(section, 'gain')
+	error = config.getfloat(section, 'error')
+	demod = config.get(section, 'demod').split(',')
+
+	rtl_exec = config.get('DEFAULT', 'rtl_path')
+	multimon_exec = config.get('DEFAULT', 'multimon_path')
+
+	logger.info('Device: {}'.format(device))
+	logger.info('Frequency: {}'.format(freq))
+	logger.info('Squelch: {}'.format(squelch))
+	logger.info('Gain: {}'.format(gain))
+	logger.info('Error: {}'.format(error))
+	logger.info('Demodulations: {}'.format(', '.join(demod)))
+
+	command = shlex.join([
+		rtl_exec,
+		'-d', str(device),
+		'-f', str(freq),
+		'-M', 'fm',
+		'-p', str(error),
+		'-E', 'DC',
+		'-F', '0',
+		'-l', str(squelch),
+		'-g', str(gain),
+		'-s', '22050'
+	])
+
+	logger.info('RTL-FM command: {}'.format(command))
+
+	rtl_logger = LogPipe(logger.getChild('rtlfm'))
+	rtl_fm = subprocess.Popen(shlex.split(command), 
+							  stdout=subprocess.PIPE,
+							  stderr=rtl_logger,
+							  shell=False)
+
+	time.sleep(SLEEP_TIME_AFTER_PROC_START)
+
+	if rtl_fm.poll():
+		logger.error('RTL FM did exit unexpected')
+		raise Exception('RTL FM did exit unexpected')
+
+	command = shlex.join([
+		multimon_exec,
+		'-a', 'ZVEI1',		# ZVEI
+		'-f', 'alpha',
+		'-t', 'raw',
+		'/dev/stdin', '-'
+	])
+
+	logger.info('multimon command: {}'.format(command))
+
+	multimon_logger = LogPipe(logger.getChild('multimon'))
+	mm = subprocess.Popen(shlex.split(command), 
+						  stdin=rtl_fm.stdout,
+						  stdout=mm_write, 
+						  stderr=multimon_logger,
+						  shell=False)
+
+	time.sleep(SLEEP_TIME_AFTER_PROC_START)
+
+	if mm.poll():
+		logger.error('multimon did exit unexpected')
+		logger.error('Kill RTL FM')
+		rtl_fm.kill()
+		raise Exception('multimon did exit unexpected')
+
+	return rtl_fm, mm
+
+
+def run_main(logger, config):
+	listener_names = config.get('DEFAULT', 'listeners').split(',')
+
+	multimon_fd_read, multimon_fd_write = os.pipe()
+	multimon_read = os.fdopen(multimon_fd_read)
+	multimon_write = os.fdopen(multimon_fd_write)
+
+	rtls = []
+	multimons = []
+
 	try:
-		logging.debug("BOSWatch shuting down")
-		if multimon_ng and multimon_ng.pid:
-			logging.debug("terminate multimon-ng (%s)", multimon_ng.pid)
-			multimon_ng.terminate()
-			multimon_ng.wait()
-			logging.debug("multimon-ng terminated")
-		if rtl_fm and rtl_fm.pid:
-			logging.debug("terminate rtl_fm (%s)", rtl_fm.pid)
-			rtl_fm.terminate()
-			rtl_fm.wait()
-			logging.debug("rtl_fm terminated")
-		logging.debug("exiting BOSWatch")
-	except:
-		logging.warning("failed in clean-up routine")
-		logging.debug("failed in clean-up routine", exc_info=True)
+		for listener_name in listener_names:
+			list_logger = logger.getChild(listener_name)
+			instances = setup_listener(list_logger, config, listener_name, multimon_write)
+			if instances is None:
+				continue
+			rtl, multimon = instances
+			rtls.append(rtl)
+			multimons.append(multimon)
+			logger.info('Started listener {}'.format(listener_name))
+		logger.info('Started all listeners')
 
+		for mmstate in multimon_read.readlines():
+			print(mmstate)
+			logger.info(mmstate)
+	except KeyboardInterrupt:
+		pass
+	except Exception as e:
+		logger.error(str(e))
+		raise e
 	finally:
-		# Close Logging
-		logging.debug("close Logging")
-		# Waiting for all Threads to write there logs
-		if globalVars.config.getboolean("BOSWatch","processAlarmAsync") == True:
-			logging.debug("waiting 3s for threads...")
-			time.sleep(3)
-		logging.info("BOSWatch exit()")
-		logging.shutdown()
-		if nmaHandler:
-			nmaHandler.close()
-		fh.close()
-		ch.close()
+		logger.info('Kill listeners')
+		for rtl, multimon in zip(rtls, multimons):
+			logger.info('Kill RTL {}'.format(rtl.pid))
+			rtl.kill()
+			logger.info('Kill multimon {}'.format(multimon.pid))
+			multimon.kill()
+
+
+def run_plugin(logger, config, plugin_name):
+	import importlib.util
+	from importlib import import_module
+
+	filename = os.path.abspath(os.path.join(
+		os.path.dirname(__file__), 
+		'plugins', 
+		plugin_name, 
+		'{}.py'.format(plugin_name)))
+
+	spec = importlib.util.spec_from_file_location(plugin_name, filename)
+	module = importlib.util.module_from_spec(spec)
+	spec.loader.exec_module(module)
+
+
+if __name__ == '__main__':
+	args = parse_args()
+	config = parse_config(args.config, args.plugin)
+
+	SLEEP_TIME_AFTER_PROC_START = config.getfloat('DEFAULT', 'processStartupTime')
+
+	logging.config.fileConfig(os.path.join(args.config, 'logging.ini'))
+
+	logger = logging.getLogger('boslog')
+	logger.info('Plugin: {}'.format(args.plugin.lower()))
+
+	if args.plugin.lower() == 'main':
+		try:
+			run_main(logger, config)
+		except Exception as e:
+			logger.error(str(e))
+			raise e
+		finally:
+			logger.info('Shutdown')
+	else:
+		logger = logger.getChild('plugin.{}'.format(args.plugin.lower()))
+		try:
+			run_plugin(logger, config, args.plugin)
+		except Exception as e:
+			logger.error(str(e))
+			raise e
+		finally:
+			logger.info('Shutdown plugin')
+
+	logger.info('Shutdown complete')
+

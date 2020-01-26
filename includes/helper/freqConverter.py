@@ -24,6 +24,6 @@ def freqToHz(freq):
 		freq = freq.replace("k","e3").replace("M","e6")
 		# freq has to be interpreted as float first...
 		# otherwise you will get the error: an invalid literal for int() with base 10
-		return int(float(freq))
+		return ':'.join(int(float(f)) for f in freq.split(':'))
 	except:
 		logging.exception("Error in freqToHz()")
