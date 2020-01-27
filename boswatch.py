@@ -17,6 +17,8 @@ SLEEP_TIME_AFTER_PROC_START = 3
 
 
 class LogPipe(threading.Thread):
+	""" Utility to log contents of a subprocess for a specific logger """
+
 	def __init__(self, logger):
 		super().__init__()
 		self.daemon = True
@@ -46,10 +48,12 @@ def parse_args():
 			   "the folder /config")
 	parser.add_argument("--config", 
 						default=os.path.abspath(os.path.join(os.path.dirname(__file__), 'config')),
-						help="Parse to config file directory")
-	parser.add_argument("--plugin",
-						default="main",
-						help="Plugin which should be started. (Main for main programming)")
+						help="Path to config file directory")
+	subparsers = parser.add_subparsers()
+	subparsers.add_parser('main', help='Start main program')
+	parser_plugin = subparsers.add_parser('plugin', help='Start plugin')
+	parser_plugin.add_argument('plugin', help='Name of the plugin to start')
+	parser_plugin.add_argument('fd', help='File descriptor of the input stream')
 	return parser.parse_args()
 
 
@@ -182,7 +186,6 @@ def run_main(logger, config):
 		logger.info('Started all listeners')
 
 		for mmstate in multimon_read.readlines():
-			print(mmstate)
 			logger.info(mmstate)
 	except KeyboardInterrupt:
 		pass
@@ -215,16 +218,18 @@ def run_plugin(logger, config, plugin_name):
 
 if __name__ == '__main__':
 	args = parse_args()
-	config = parse_config(args.config, args.plugin)
+	config_path = args.config
+	plugin = args.plugin if 'plugin' in args else 'main'
+	config = parse_config(args.config, plugin)
 
 	SLEEP_TIME_AFTER_PROC_START = config.getfloat('DEFAULT', 'processStartupTime')
 
 	logging.config.fileConfig(os.path.join(args.config, 'logging.ini'))
 
 	logger = logging.getLogger('boslog')
-	logger.info('Plugin: {}'.format(args.plugin.lower()))
+	logger.info('Plugin: {}'.format(plugin.lower()))
 
-	if args.plugin.lower() == 'main':
+	if plugin.lower() == 'main':
 		try:
 			run_main(logger, config)
 		except Exception as e:
@@ -233,9 +238,9 @@ if __name__ == '__main__':
 		finally:
 			logger.info('Shutdown')
 	else:
-		logger = logger.getChild('plugin.{}'.format(args.plugin.lower()))
+		logger = logger.getChild('plugin.{}'.format(plugin.lower()))
 		try:
-			run_plugin(logger, config, args.plugin)
+			run_plugin(logger, config, plugin)
 		except Exception as e:
 			logger.error(str(e))
 			raise e
